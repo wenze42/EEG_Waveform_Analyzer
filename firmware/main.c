@@ -1,22 +1,32 @@
 /*
- * EEG Waveform Monitor - STM32F103C8T6 firmware
+ * EEG Waveform Monitor - STM32F103C8T6 + ADS1291 firmware
  *
  * Sampling pipeline:
- *   TIM3 update event (250 Hz) -> ADC1 software start -> EOC IRQ
- *   -> samples pushed to a ring buffer -> main loop flushes in framed packets
+ *   ADS1291 (DRDY falling edge) -> EXTI -> SPI1 read 24-bit sample
+ *   -> samples pushed to ring buffer -> main loop packs into framed packets
  *   -> USART1 TX @ 115200 baud to USB-TTL adapter
  *
  * Packet format (binary, little-endian):
- *   [0xAA][0x55][seq:u16][count:u16][samples:count * i16][crc8:u8]
+ *   [0xAA][0x55][seq:u16][count:u16][samples:count * i32][crc8:u8]
  *
- * Wiring (Blue Pill ↔ AD8232 Heart Monitor breakout):
- *   PA0  <- AD8232 OUTPUT
- *   PA9  -> USB-TTL RXD  (USART1 TX)
- *   PA10 <- USB-TTL TXD  (USART1 RX, optional)
- *   PC13 -> onboard LED  (status blink)
- *   3V3  -> AD8232 SDN  (⚠️ 使能脚,低则芯片睡眠无输出!)
- *   3V3  -> AD8232 3.3v
- *   GND  -> AD8232 GND
+ * ADS1291 SPI interface:
+ *   PA4  -> SPI1_NSS  (ADS1291 CS)
+ *   PA5  -> SPI1_SCK  (ADS1291 SCLK)
+ *   PA6  <- SPI1_MISO (ADS1291 DOUT)
+ *   PA7  -> SPI1_MOSI (ADS1291 DIN)
+ *   PA3  <- ADS1291 DRDY (falling edge interrupt)
+ *   3V3  -> ADS1291 DVDD (digital supply)
+ *   GND  -> ADS1291 DGND
+ *   AVDD -> ADS1291 AVDD (analog supply, typically 2.7-5.25V)
+ *   AGND -> ADS1291 AGND
+ *   VREFP/ VREFN -> ADS1291 reference (internal or external)
+ *
+ * ADS1291 register configuration:
+ *   CONFIG1 = 0x02 (DR = 250 SPS, CLK = 2.048 MHz)
+ *   CONFIG2 = 0x00 (RLD off for single channel, normal mode)
+ *   CONFIG3 = 0x00 (external reference)
+ *   CH1SET  = 0x06 (gain = 6, input = normal electrode)
+ *   CH2SET  = 0x01 (power down, unused)
  */
 
 #include "stm32f1xx_hal.h"
@@ -25,69 +35,67 @@
 /* ------------------------------------------------------------------ */
 /*  Handles and globals                                                */
 /* ------------------------------------------------------------------ */
-ADC_HandleTypeDef  hadc1;
+SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart1;
-TIM_HandleTypeDef  htim3;
 
 #define SAMPLE_RATE_HZ      250U
-#define ADC_FULL_SCALE      4096U          /* 12-bit ADC                  */
-#define ADC_MID             2048U          /* mid-scale offset            */
-#define FRAME_MAX_SAMPLES   16U            /* samples per packet          */
+#define FRAME_MAX_SAMPLES   8U              /* 8 samples per packet (32-bit) */
 #define FRAME_HEADER0       0xAAU
 #define FRAME_HEADER1       0x55U
 
-static volatile uint16_t g_seq         = 0;
-static volatile int16_t  g_ring[256];      /* ring buffer of int16 samples */
-static volatile uint16_t g_ring_head   = 0;
-static volatile uint16_t g_ring_tail   = 0;
-static volatile uint16_t g_ring_count  = 0;
-static volatile uint16_t g_latest_raw  = 0;
-static volatile uint8_t  g_adc_ready   = 0;
+static volatile uint16_t g_seq = 0;
+static volatile int32_t  g_ring[256];       /* ring buffer of 32-bit samples */
+static volatile uint16_t g_ring_head = 0;
+static volatile uint16_t g_ring_tail = 0;
+static volatile uint16_t g_ring_count = 0;
+static volatile uint8_t  g_drdy_flag = 0;
 
 /* ------------------------------------------------------------------ */
 /*  Forward declarations                                               */
 /* ------------------------------------------------------------------ */
 void SystemClock_Config(void);
-void ADC_Init(void);
+void SPI1_Init(void);
 void UART_Init(void);
-void TIM3_Init(void);
-void LED_Init(void);
+void GPIO_Init(void);
 void Error_Handler(void);
-void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc);
+void HAL_SPI_MspInit(SPI_HandleTypeDef *hspi);
 void HAL_UART_MspInit(UART_HandleTypeDef *huart);
 static uint8_t crc8(const uint8_t *data, uint16_t len);
-static void ring_push(int16_t v);
-static uint16_t ring_pop_batch(int16_t *out, uint16_t max);
+static void ring_push(int32_t v);
+static uint16_t ring_pop_batch(int32_t *out, uint16_t max);
 static void send_frame(void);
 static void led_toggle(void);
+static int32_t ADS1291_ReadSample(void);
+static void ADS1291_Init(void);
+static void ADS1291_WriteReg(uint8_t addr, uint8_t val);
+static uint8_t ADS1291_ReadReg(uint8_t addr);
 
 /* ------------------------------------------------------------------ */
-/*  Main                                                              */
+/*  Main                                                               */
 /* ------------------------------------------------------------------ */
 int main(void)
 {
     HAL_Init();
     SystemClock_Config();
 
-    LED_Init();
-    ADC_Init();
+    GPIO_Init();
+    SPI1_Init();
     UART_Init();
-    TIM3_Init();
 
-    /* Self-calibration of the ADC (improves offset/linearity). */
-    if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK) {
-        Error_Handler();
-    }
+    /* Initialize ADS1291 */
+    ADS1291_Init();
 
-    /* Start ADC with EOC interrupt; TIM3 TRGO will trigger conversions. */
-    if (HAL_ADC_Start_IT(&hadc1) != HAL_OK) {
-        Error_Handler();
-    }
-    if (HAL_TIM_Base_Start(&htim3) != HAL_OK) {
-        Error_Handler();
-    }
+    /* Enable EXTI on PA3 (DRDY falling edge) */
+    HAL_NVIC_SetPriority(EXTI3_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 
     while (1) {
+        if (g_drdy_flag) {
+            g_drdy_flag = 0;
+            int32_t sample = ADS1291_ReadSample();
+            ring_push(sample);
+        }
+
         if (g_ring_count >= FRAME_MAX_SAMPLES) {
             send_frame();
             led_toggle();
@@ -104,20 +112,20 @@ void SystemClock_Config(void)
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLMUL     = RCC_PLL_MUL9;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
         Error_Handler();
     }
 
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                       RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;   /* APB1 = 36 MHz */
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;   /* APB2 = 72 MHz */
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                  RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
     if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
         Error_Handler();
     }
@@ -126,27 +134,35 @@ void SystemClock_Config(void)
 /* ------------------------------------------------------------------ */
 /*  GPIO / peripheral MSP init                                         */
 /* ------------------------------------------------------------------ */
-void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
+void HAL_SPI_MspInit(SPI_HandleTypeDef *hspi)
 {
-    if (hadc->Instance != ADC1) {
+    if (hspi->Instance != SPI1) {
         return;
     }
 
-    __HAL_RCC_ADC1_CLK_ENABLE();
+    __HAL_RCC_SPI1_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_DMA1_CLK_ENABLE();   /* kept for future DMA mode */
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin  = GPIO_PIN_0;            /* PA0 = ADC1_IN0 */
-    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    /* PA4 = NSS (output push-pull), PA5 = SCK, PA7 = MOSI (alternate push-pull)
+       PA6 = MISO (input floating) */
+    GPIO_InitStruct.Pin = GPIO_PIN_5 | GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_4;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* ADC clock = PCLK2/2 = 36 MHz (set by ADCPRE in CFGR). */
-    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
-    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
-    PeriphClkInit.AdcClockSelection     = RCC_ADCPCLK2_DIV2;
-    HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
+    /* NSS high by default */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
 }
 
 void HAL_UART_MspInit(UART_HandleTypeDef *huart)
@@ -159,33 +175,49 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin   = GPIO_PIN_9 | GPIO_PIN_10;
-    GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
-/* ------------------------------------------------------------------ */
-/*  ADC: 12-bit, software-start, single channel, EOC interrupt        */
-/* ------------------------------------------------------------------ */
-void ADC_Init(void)
+void GPIO_Init(void)
 {
-    hadc1.Instance                   = ADC1;
-    hadc1.Init.ScanConvMode          = ADC_SCAN_DISABLE;
-    hadc1.Init.ContinuousConvMode    = DISABLE;        /* TIM3 triggers */
-    hadc1.Init.DiscontinuousConvMode = DISABLE;
-    hadc1.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
-    hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
-    hadc1.Init.NbrOfConversion       = 1;
-    if (HAL_ADC_Init(&hadc1) != HAL_OK) {
-        Error_Handler();
-    }
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel       = ADC_CHANNEL_0;
-    sConfig.Rank          = 1;
-    sConfig.SamplingTime  = ADC_SAMPLETIME_55CYCLES_5;   /* ~1.5 us @ 36 MHz */
-    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    /* PA3 = DRDY input with EXTI */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* PC13 = LED output */
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+}
+
+/* ------------------------------------------------------------------ */
+/*  SPI1: 1 MHz clock, mode 0, 8-bit data                              */
+/* ------------------------------------------------------------------ */
+void SPI1_Init(void)
+{
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64; /* 72MHz/64 = 1.125 MHz */
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
         Error_Handler();
     }
 }
@@ -195,13 +227,13 @@ void ADC_Init(void)
 /* ------------------------------------------------------------------ */
 void UART_Init(void)
 {
-    huart1.Instance        = USART1;
-    huart1.Init.BaudRate   = 115200;
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits   = UART_STOPBITS_1;
-    huart1.Init.Parity     = UART_PARITY_NONE;
-    huart1.Init.Mode       = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl  = UART_HWCONTROL_NONE;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart1.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&huart1) != HAL_OK) {
         Error_Handler();
@@ -209,70 +241,124 @@ void UART_Init(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  TIM3: 250 Hz update event (TRGO) - drives ADC conversions          */
-/*  APB1 timer clock = 72 MHz, PSC = 7199 -> 10 kHz, ARR = 39 -> 250 Hz*/
+/*  ADS1291 SPI helper functions                                       */
 /* ------------------------------------------------------------------ */
-void TIM3_Init(void)
-{
-    __HAL_RCC_TIM3_CLK_ENABLE();
+static void SPI_CS_Low(void) {
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+}
 
-    htim3.Instance               = TIM3;
-    htim3.Init.Prescaler         = 7199U;
-    htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim3.Init.Period            = 39U;
-    htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    if (HAL_TIM_Base_Init(&htim3) != HAL_OK) {
-        Error_Handler();
+static void SPI_CS_High(void) {
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+}
+
+static void SPI_WriteByte(uint8_t data) {
+    HAL_SPI_Transmit(&hspi1, &data, 1, 100);
+}
+
+static uint8_t SPI_ReadByte(void) {
+    uint8_t data = 0;
+    HAL_SPI_Receive(&hspi1, &data, 1, 100);
+    return data;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ADS1291 register operations                                        */
+/* ------------------------------------------------------------------ */
+static void ADS1291_WriteReg(uint8_t addr, uint8_t val) {
+    SPI_CS_Low();
+    SPI_WriteByte(0x40 | addr);  /* WREG command */
+    SPI_WriteByte(0x00);         /* number of registers - 1 */
+    SPI_WriteByte(val);
+    SPI_CS_High();
+}
+
+static uint8_t ADS1291_ReadReg(uint8_t addr) {
+    uint8_t val;
+    SPI_CS_Low();
+    SPI_WriteByte(0x20 | addr);  /* RREG command */
+    SPI_WriteByte(0x00);
+    val = SPI_ReadByte();
+    SPI_CS_High();
+    return val;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ADS1291 initialization                                             */
+/* ------------------------------------------------------------------ */
+static void ADS1291_Init(void) {
+    /* Reset sequence */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(10);
+    SPI_CS_Low();
+    SPI_WriteByte(0x06);  /* RESET command */
+    HAL_Delay(10);
+    SPI_CS_High();
+    HAL_Delay(10);
+
+    /* Configure registers */
+    ADS1291_WriteReg(0x01, 0x02);  /* CONFIG1: DR = 250 SPS */
+    ADS1291_WriteReg(0x02, 0x00);  /* CONFIG2: RLD off, normal mode */
+    ADS1291_WriteReg(0x03, 0x00);  /* CONFIG3: external reference */
+    ADS1291_WriteReg(0x04, 0x06);  /* CH1SET: gain = 6, normal electrode input */
+    ADS1291_WriteReg(0x05, 0x01);  /* CH2SET: power down */
+
+    /* Start continuous conversion */
+    SPI_CS_Low();
+    SPI_WriteByte(0x08);  /* START command */
+    SPI_CS_High();
+    HAL_Delay(10);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Read 24-bit sample from ADS1291                                    */
+/* ------------------------------------------------------------------ */
+static int32_t ADS1291_ReadSample(void) {
+    uint8_t data[3];
+    int32_t sample = 0;
+
+    SPI_CS_Low();
+    SPI_WriteByte(0x11);  /* RDATAC command */
+    data[0] = SPI_ReadByte();
+    data[1] = SPI_ReadByte();
+    data[2] = SPI_ReadByte();
+    SPI_CS_High();
+
+    /* Convert 24-bit two's complement to 32-bit signed */
+    sample = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | data[2];
+    if (sample & 0x800000) {
+        sample |= 0xFF000000;  /* sign extend */
     }
 
-    TIM_MasterConfigTypeDef sMaster = {0};
-    sMaster.MasterOutputTrigger = TIM_TRGO_UPDATE;
-    sMaster.MasterSlaveMode    = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMaster) != HAL_OK) {
-        Error_Handler();
+    return sample;
+}
+
+/* ------------------------------------------------------------------ */
+/*  EXTI interrupt handler for DRDY (PA3)                              */
+/* ------------------------------------------------------------------ */
+void EXTI3_IRQHandler(void) {
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_3);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_3) {
+        g_drdy_flag = 1;
     }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Onboard LED on PC13 (active-low on Blue Pill)                      */
+/*  Ring buffer helpers                                                */
 /* ------------------------------------------------------------------ */
-void LED_Init(void)
-{
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin   = GPIO_PIN_13;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);  /* LED off */
-}
-
-static void led_toggle(void)
-{
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Ring buffer helpers (single producer = ADC IRQ, single consumer   */
-/*  = main loop). Lock-free for the SPSC case.                         */
-/* ------------------------------------------------------------------ */
-static void ring_push(int16_t v)
-{
+static void ring_push(int32_t v) {
     g_ring[g_ring_head] = v;
-    g_ring_head = (g_ring_head + 1U) & 0xFFU;            /* mod 256 */
+    g_ring_head = (g_ring_head + 1U) & 0xFFU;
     if (g_ring_count < 256U) {
         g_ring_count++;
     } else {
-        /* Overwrite oldest: advance tail to match head. */
         g_ring_tail = g_ring_head;
     }
 }
 
-static uint16_t ring_pop_batch(int16_t *out, uint16_t max)
-{
+static uint16_t ring_pop_batch(int32_t *out, uint16_t max) {
     __disable_irq();
     uint16_t n = (g_ring_count < max) ? g_ring_count : max;
     for (uint16_t i = 0; i < n; i++) {
@@ -287,8 +373,7 @@ static uint16_t ring_pop_batch(int16_t *out, uint16_t max)
 /* ------------------------------------------------------------------ */
 /*  Frame transmit                                                     */
 /* ------------------------------------------------------------------ */
-static uint8_t crc8(const uint8_t *data, uint16_t len)
-{
+static uint8_t crc8(const uint8_t *data, uint16_t len) {
     uint8_t crc = 0x00;
     for (uint16_t i = 0; i < len; i++) {
         crc ^= data[i];
@@ -303,15 +388,14 @@ static uint8_t crc8(const uint8_t *data, uint16_t len)
     return crc;
 }
 
-static void send_frame(void)
-{
-    static int16_t samples[FRAME_MAX_SAMPLES];
+static void send_frame(void) {
+    static int32_t samples[FRAME_MAX_SAMPLES];
     uint16_t n = ring_pop_batch(samples, FRAME_MAX_SAMPLES);
     if (n == 0U) {
         return;
     }
 
-    uint8_t pkt[6 + FRAME_MAX_SAMPLES * 2 + 1];
+    uint8_t pkt[6 + FRAME_MAX_SAMPLES * 4 + 1];  /* 32-bit samples */
     uint16_t idx = 0U;
 
     pkt[idx++] = FRAME_HEADER0;
@@ -320,8 +404,8 @@ static void send_frame(void)
     pkt[idx++] = (uint8_t)((g_seq >> 8) & 0xFF);
     pkt[idx++] = (uint8_t)(n & 0xFF);
     pkt[idx++] = (uint8_t)((n >> 8) & 0xFF);
-    memcpy(&pkt[idx], samples, n * 2U);
-    idx += (uint16_t)(n * 2U);
+    memcpy(&pkt[idx], samples, n * 4U);
+    idx += (uint16_t)(n * 4U);
     pkt[idx] = crc8(pkt, idx);
     idx++;
 
@@ -330,36 +414,19 @@ static void send_frame(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  ADC end-of-conversion callback                                     */
+/*  LED toggle                                                         */
 /* ------------------------------------------------------------------ */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc->Instance != ADC1) {
-        return;
-    }
-
-    uint16_t raw = HAL_ADC_GetValue(&hadc1);
-    g_latest_raw = raw;
-
-    /* Center around zero and scale to int16 range.
-     * raw is 0..4095, subtract mid -> -2048..2047, scale x8 to ~-16384..16383.
-     */
-    int16_t v = (int16_t)(((int32_t)raw - (int32_t)ADC_MID) * 8);
-    ring_push(v);
-
-    /* Re-arm ADC for the next TIM3-triggered conversion. */
-    HAL_ADC_Start_IT(&hadc1);
+static void led_toggle(void) {
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
 }
 
 /* ------------------------------------------------------------------ */
-/*  Error handler: blink LED forever at ~5 Hz                          */
+/*  Error handler                                                      */
 /* ------------------------------------------------------------------ */
-void Error_Handler(void)
-{
+void Error_Handler(void) {
     __disable_irq();
     while (1) {
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        /* Rough delay at 72 MHz: ~100 k cycles. */
         for (volatile uint32_t i = 0; i < 100000U; i++) {
             __NOP();
         }
@@ -367,9 +434,8 @@ void Error_Handler(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Required HAL tick (SysTick) - provided by HAL, override optional   */
+/*  SysTick handler                                                    */
 /* ------------------------------------------------------------------ */
-void SysTick_Handler(void)
-{
+void SysTick_Handler(void) {
     HAL_IncTick();
 }

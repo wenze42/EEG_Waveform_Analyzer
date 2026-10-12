@@ -1,10 +1,10 @@
-"""Threaded serial reader for the EEG firmware binary stream protocol.
+"""Threaded serial reader for the EEG firmware binary stream protocol (ADS1291).
 
 Frame layout (little-endian):
-    [0xAA][0x55][seq:u16][count:u16][samples:count * i16][crc8]
+    [0xAA][0x55][seq:u16][count:u16][samples:count * i32][crc8]
 
 A background thread pulls bytes from the serial port, reassembles frames,
-verifies the CRC8 and pushes the decoded int16 samples onto a thread-safe
+verifies the CRC8 and pushes the decoded int32 samples onto a thread-safe
 ring buffer. The UI/analysis thread consumes them via get_latest().
 """
 
@@ -24,7 +24,7 @@ from logger import logger
 _FRAME_HEADER = config.FRAME_HEADER        # b"\xAA\x55"
 _HEADER_LEN = 6                            # 2 sync + 2 seq + 2 count
 _CRC_LEN = 1
-_MAX_SAMPLES_PER_FRAME = 256               # safety bound
+_MAX_SAMPLES_PER_FRAME = 8                 # ADS1291 sends 8 samples per frame
 
 
 def _crc8(data: bytes) -> int:
@@ -151,7 +151,7 @@ class SerialEEGReader:
             del self._rx_bytes[:2]
             return None
 
-        total_len = _HEADER_LEN + count * 2 + _CRC_LEN
+        total_len = _HEADER_LEN + count * 4 + _CRC_LEN  # 4 bytes per sample (int32)
         if len(self._rx_bytes) < total_len:
             return None
 
@@ -159,8 +159,8 @@ class SerialEEGReader:
         crc_recv = self._rx_bytes[total_len - _CRC_LEN]
         crc_calc = _crc8(payload)
         samples = np.frombuffer(
-            payload[_HEADER_LEN:], dtype="<i2", count=count
-        ).astype(np.int16)
+            payload[_HEADER_LEN:], dtype="<i4", count=count
+        ).astype(np.int32)
 
         del self._rx_bytes[:total_len]
         return seq, count, samples, (crc_recv == crc_calc)
@@ -169,16 +169,16 @@ class SerialEEGReader:
     #  Public data access                                                #
     # ------------------------------------------------------------------ #
     def get_latest(self, n: int = config.BUFFER_SIZE) -> np.ndarray:
-        """Return up to the n most recent samples as an int16 numpy array.
+        """Return up to the n most recent samples as an int32 numpy array.
 
         Non-destructive peek - samples stay in the buffer.
         """
         with self._lock:
             if not self._buffer:
-                return np.empty(0, dtype=np.int16)
+                return np.empty(0, dtype=np.int32)
             take = min(n, len(self._buffer))
             data = list(self._buffer)[-take:]
-        return np.asarray(data, dtype=np.int16)
+        return np.asarray(data, dtype=np.int32)
 
     def drain_new_samples(self) -> np.ndarray:
         """Return and remove all samples accumulated since the last drain.
@@ -188,10 +188,15 @@ class SerialEEGReader:
         """
         with self._lock:
             if not self._buffer:
-                return np.empty(0, dtype=np.int16)
+                return np.empty(0, dtype=np.int32)
             data = list(self._buffer)
             self._buffer.clear()
-        return np.asarray(data, dtype=np.int16)
+        return np.asarray(data, dtype=np.int32)
 
     def read_samples(self, count: int = config.BUFFER_SIZE) -> np.ndarray:
         return self.get_latest(count)
+
+    def to_microvolts(self, data: np.ndarray) -> np.ndarray:
+        """Convert ADS1291 raw counts to microvolts."""
+        return (data / config.ADS1291_RESOLUTION) * \
+               (config.ADS1291_VREF / config.ADS1291_GAIN) * 1e6

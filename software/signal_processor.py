@@ -71,8 +71,8 @@ class SignalProcessor:
         return lfilter(b, a, np.asarray(data, dtype=np.float32)).astype(np.float32)
 
     def prefilter(self, data: np.ndarray) -> np.ndarray:
-        """Apply line-notch + high-pass to clean DC and 50 Hz interference."""
-        out = self.notch(np.asarray(data, dtype=np.float32))
+        """Apply high-pass to clean DC offset (ADS1291 handles 50Hz notch)."""
+        out = np.asarray(data, dtype=np.float32)
         # 0.5 Hz high-pass to remove residual baseline drift.
         nyq = 0.5 * self.fs
         b, a = butter(2, 0.5 / nyq, btype="high")

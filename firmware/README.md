@@ -1,20 +1,15 @@
-# EEG Monitor Firmware
+# EEG Monitor Firmware (ADS1291 Version)
 
-STM32F103C8T6 firmware that samples a single EEG channel at **250 Hz** and
-streams framed samples to the host PC over USART1 @ 115200 baud.
+STM32F103C8T6 firmware that samples a single EEG channel via **ADS1291** 24-bit ADC at **250 SPS** and streams framed samples to the host PC over USART1 @ 115200 baud.
 
 ## Sampling pipeline
 
 ```
-AD8232 OUT --PA0--> ADC1_IN0
-                    |
-   TIM3 (250 Hz TRGO) triggers conversion
-                    |
-              EOC IRQ -> ring buffer (SPSC, 256 slots)
-                    |
-              main loop packs 16 samples into a framed packet
-                    |
-              USART1 TX (PA9) -> USB-TTL adapter -> PC
+电极 → ADS1291 (INP/INN 差分输入, RLD 右腿驱动)
+         ↓ SPI1 (1.125 MHz)
+STM32F103C8T6 (DRDY 下降沿中断 → 读取 24-bit 样本)
+         ↓ USART1 TX (PA9)
+USB-TTL 适配器 → PC
 ```
 
 ### Packet format (binary, little-endian)
@@ -24,70 +19,98 @@ AD8232 OUT --PA0--> ADC1_IN0
 | 0      | sync0  | u8     | 0xAA                                 |
 | 1      | sync1  | u8     | 0x55                                 |
 | 2..3   | seq    | u16 LE | increments per packet                |
-| 4..5   | count  | u16 LE | number of int16 samples (<=16)        |
-| 6..    | data   | i16[]  | `count` little-endian int16 samples  |
+| 4..5   | count  | u16 LE | number of int32 samples (<=8)        |
+| 6..    | data   | i32[]  | `count` little-endian int32 samples  |
 | end-1  | crc8   | u8     | CRC-8 (poly 0x07) over all preceding |
 
-Sample value: `(raw_adc - 2048) * 8`, so the int16 range roughly maps the
-full ADC swing with headroom. On the host, divide by 8 to recover the
-centered 12-bit value.
+**Sample value**: 24-bit signed two's complement, sign-extended to 32-bit.
+Range: `-8,388,608` to `+8,388,607`. To convert to voltage:
+```
+V = (sample / 2^23) * Vref / gain
+```
+Where `Vref = 2.4V` (external) and `gain = 6` (default).
 
 ## Bill of materials (器件清单)
 
 | # | Part                       | Spec / value                          | Qty | Notes                                           |
 |---|----------------------------|---------------------------------------|-----|-------------------------------------------------|
-| 1 | Microcontroller            | STM32F103C8T6 (Blue Pill)             | 1   | 72 MHz, 12-bit ADC, USART1                      |
-| 2 | Analog front-end           | AD8232 heart-rate/EEG AFE             | 1   | Single-supply, instrument amp + HP/LP filters    |
+| 1 | Microcontroller            | STM32F103C8T6 (Blue Pill)             | 1   | 72 MHz, SPI1, USART1                            |
+| 2 | Analog front-end           | ADS1291 module                        | 1   | 24-bit EEG AFE, built-in RLD + notch filter    |
 | 3 | EEG electrodes             | Ag/AgCl cup or disposable             | 3   | RA, LA, RL (or 1 signal + 1 ref + 1 driven)     |
 | 4 | Electrode lead wire set    | snap or DIN, shielded                 | 1   | ~1 m, matches electrode connectors              |
 | 5 | Conductive gel             | Ten20 or equivalent                   | 1   | Improve skin contact                            |
-| 6 | USB-TTL serial adapter     | CP2102 / CH340 / FT232                 | 1   | 3.3 V logic, 115200 baud                         |
-| 7 | Power source               | USB 5 V or 3.3 V LDO board             | 1   | STM32 + AD8232 can run from USB                  |
-| 8 | Decoupling caps            | 100 nF + 10 uF                        | 2   | Across AD8232 Vcc/GND                            |
-| 9 | LED (status)               | PC13 onboard LED                      | 1   | Blue Pill already has this                       |
-| 10| Resistor (optional)        | 10 kOhm                               | 1   | MCU BOOT0 pull-down if reusing bare board        |
+| 6 | USB-TTL serial adapter     | CP2102 / CH340 / FT232                 | 1   | 3.3 V logic, 115200 baud                        |
+| 7 | Power source               | USB 5 V or 3.3 V LDO board             | 1   | STM32 + ADS1291 can run from USB                 |
+| 8 | Decoupling caps            | 100 nF + 10 µF                        | 2   | Across ADS1291 DVDD/DGND                        |
+| 9 | Reference capacitor        | 10 µF tantalum or ceramic             | 1   | Across VREFP/VREFN (if using external ref)       |
+| 10| LED (status)               | PC13 onboard LED                      | 1   | Blue Pill already has this                       |
 
-> AD8232 is biologically safe for learning purposes. It is **not** a medical-
-> grade device. Always power from a floating source (battery or isolated USB)
-> when connecting electrodes to a person.
+> ADS1291 is a **medical-grade** analog front-end specifically designed for
+> EEG applications. It is safe for learning purposes when powered from a
+> floating source (battery or isolated USB). Always use a medically isolated
+> power supply when connecting electrodes to a person.
 
-## Wiring (Blue Pill + AD8232 Heart Monitor breakout)
+## Wiring (Blue Pill + ADS1291 module)
 
-> ⚠️ **SDN 必须接 3V3** — AD8232 的 SDN 引脚是使能脚,低电平时芯片睡眠
-> 完全不输出,这是最常见的接错点。板子丝印从上到下依次为:
-> `GND | 3.3v | OUTPUT | LO- | LO+ | SDN`,上方另有 `RL | LA | RA` 电极插口。
+### Power & ground
 
-| STM32F103C8T6 | AD8232 breakout | 说明                                |
-|---------------|-----------------|-------------------------------------|
-| 3V3           | **3.3v**        | 模块供电 (板载 LDO 给芯片)          |
-| 3V3           | **SDN**         | 使能脚拉高,否则芯片睡眠无输出       |
-| GND           | **GND**         | 必须共地                            |
-| PA0 / ADC1_IN0| **OUTPUT**      | 唯一采样信号                        |
-| 悬空          | LO- / LO+       | 导联脱落检测,本项目不用             |
-| 5V (USB)      | 3.3V LDO 输入   | 板载 LDO 也可由 5V 供电(可选)       |
-| PA9 (USART1_TX)| USB-TTL RXD    | MCU -> PC 数据                      |
-| PA10 (USART1_RX)| USB-TTL TXD    | 可选(无 RX 用途)                    |
-| PC13          | 板载 LED        | 每帧翻转状态指示                    |
+| STM32F103C8T6 | ADS1291 module | Function              |
+|---------------|----------------|-----------------------|
+| 3V3           | DVDD           | Digital supply        |
+| GND           | DGND           | Digital ground        |
+| 3.3V LDO      | AVDD           | Analog supply (2.7-5.25V) |
+| GND           | AGND           | Analog ground         |
+| 3.3V LDO      | VREFP          | Reference positive    |
+| GND           | VREFN          | Reference negative    |
 
-AD8232 电极安放 (Einthoven 单通道):
-- **RA** 插口 → 右臂电极
-- **LA** 插口 → 左臂电极 (若检测视觉皮层 α 波,改放枕部 O1/O2)
-- **RL** 插口 → 右腿电极 (驱动参考,抑制共模干扰)
-- 电极先涂导电膏再贴,接触阻抗越低波形越好
+### SPI interface
 
-### 电阻调参(可选,把心电 AFE 真正变成 EEG AFE)
+| STM32F103C8T6 | ADS1291 module | Function              |
+|---------------|----------------|-----------------------|
+| PA4 (SPI1_NSS)  | CS             | Chip select (active low) |
+| PA5 (SPI1_SCK)  | SCLK           | SPI clock             |
+| PA6 (SPI1_MISO) | DOUT           | Data output (ADS1291 → STM32) |
+| PA7 (SPI1_MOSI) | DIN            | Data input (STM32 → ADS1291) |
+| PA3 (EXTI3)     | DRDY           | Data ready (falling edge) |
 
-出厂默认参数是心电拓扑,对 EEG 有两个硬伤。建议第一次先不改电阻跑通链路,
-再按需调整:
+### UART interface
 
-| 目标 | 板上位置 | 默认值 | EEG 改值 | 效果 |
-|------|----------|--------|----------|------|
-| **增益 ×100 → ×500** | AD8232 芯片左上侧的 R5、R6 (两颗 10kΩ) | 10 kΩ | **2.2 kΩ** | 放大倍数从 ~100× 提到 ~500×,才够驱动 10–100 μV 的 EEG 信号 |
-| **高通 0.5 Hz → 0.1 Hz** | AD8232 芯片右下侧 R3 旁的 C1 电容 (10 µF) | 10 µF | **47 µF** | 高通截止频率从 ~0.5 Hz 降到 ~0.1 Hz,保留 δ 波 (0.5–4 Hz) 和深睡相关的慢波 |
-| **电源去耦** | 模块 3.3V 和 GND 之间 | 板上已带 100nF+10µF | 板外再并联 **10 µH 磁珠 + 100 nF** | 减少电源线串入的 50/60 Hz 工频干扰 |
+| STM32F103C8T6 | USB-TTL adapter | Function              |
+|---------------|-----------------|-----------------------|
+| PA9 (USART1_TX) | RXD           | MCU → PC data         |
+| PA10 (USART1_RX)| TXD           | Optional (no RX use)  |
+| PC13          | onboard LED     | 250 Hz packet blink   |
 
-> 改电阻/电容需要镊子和焊锡。找不到板上元件时,推荐先用默认值跑起来验证
-> 链路——α 波 (8–12 Hz) 在枕部闭眼时幅值相对最大,不调参也能看到。
+### Electrode connections
+
+| ADS1291 module | Electrode | Function              |
+|----------------|-----------|-----------------------|
+| IN1P (INP)     | RA        | Right arm (positive)  |
+| IN1N (INN)     | LA        | Left arm (negative)   |
+| RLD (RL)       | RL        | Right leg (driven reference) |
+
+For better alpha detection, place LA on the occipital region (O1/O2).
+
+## ADS1291 register configuration
+
+The firmware configures the following registers at startup:
+
+| Register | Address | Value | Description                          |
+|----------|---------|-------|--------------------------------------|
+| CONFIG1  | 0x01    | 0x02  | DR = 250 SPS, CLK = 2.048 MHz        |
+| CONFIG2  | 0x02    | 0x00  | RLD off, normal mode                 |
+| CONFIG3  | 0x03    | 0x00  | External reference                   |
+| CH1SET   | 0x04    | 0x06  | Gain = 6, normal electrode input     |
+| CH2SET   | 0x05    | 0x01  | Power down (unused channel)          |
+
+### Adjustable parameters (software configurable)
+
+| Parameter | Register | Value range | Effect                               |
+|-----------|----------|-------------|--------------------------------------|
+| Gain      | CH1SET   | 0x00-0x07   | 1, 2, 4, 6, 8, 12, 24 (×Vref)        |
+| Sample rate| CONFIG1 | 0x00-0x07   | 250, 500, 1k, 2k, 4k, 8k, 16k SPS    |
+| Notch filter| CONFIG2 | bit 6       | 50Hz/60Hz notch (enable/disable)     |
+| RLD       | CONFIG2  | bit 5       | Right-leg drive (enable/disable)     |
 
 ## Build
 
@@ -100,18 +123,17 @@ This firmware assumes STM32Cube HAL. Recommended build paths:
 
 Required HAL modules:
 - `stm32f1xx_hal_rcc`, `stm32f1xx_hal_gpio`
-- `stm32f1xx_hal_adc` (and `stm32f1xx_hal_adc_ex` for calibration)
+- `stm32f1xx_hal_spi`
 - `stm32f1xx_hal_uart`
-- `stm32f1xx_hal_tim` (and `_ex` for TRGO config)
+- `stm32f1xx_hal_exti`
 
 ### Tweakable constants
 
 | Macro / symbol      | Default | Effect                                |
 |---------------------|---------|---------------------------------------|
-| `TIM3` PSC/ARR      | 7199/39 | 250 Hz sampling (10 kHz / 40)         |
-| `ADC_SAMPLETIME_*`  | 55.5 cy | ~1.5 us acquisition at 36 MHz          |
-| `FRAME_MAX_SAMPLES` | 16      | Samples packed per UART frame         |
-| `ADC_MID`           | 2048    | Mid-scale offset subtracted in IRQ    |
+| `SPI1` baud rate    | 1.125 MHz | SPI clock speed                      |
+| `FRAME_MAX_SAMPLES` | 8       | Samples packed per UART frame         |
+| `SAMPLE_RATE_HZ`    | 250     | ADS1291 sample rate (CONFIG1 DR bits) |
 
 ## Notes / safety
 
@@ -120,5 +142,8 @@ Required HAL modules:
 - Connect electrodes to a human only with a fully floating power source
   (battery or medically isolated supply). Never use mains-powered
   equipment without isolation.
-- The 50 Hz notch and 0.5 Hz high-pass filters run on the host side
-  (`software/signal_processor.py`).
+- The 50 Hz notch filter is **built into ADS1291** (CONFIG2 bit 6) and can be
+  enabled/disabled via software. No host-side notch filter is needed.
+- ADS1291 provides **24-bit resolution**, which is sufficient to capture
+  δ (0.5-4 Hz), θ (4-8 Hz), α (8-12 Hz), β (12-30 Hz), and γ (30-80 Hz)
+  bands without additional analog filtering.
