@@ -1,4 +1,6 @@
-numpy
-scipy
-matplotlib
-pyserial
+numpy>=1.22
+scipy>=1.8
+matplotlib>=3.5
+pyserial>=3.5
+h5py>=3.7
+pandas>=1.4

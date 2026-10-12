@@ -1,110 +1,105 @@
-#include "stm32f1xx_hal.h"
+# EEG Monitor Firmware
 
-ADC_HandleTypeDef hadc1;
-UART_HandleTypeDef huart1;
+STM32F103C8T6 firmware that samples a single EEG channel at **250 Hz** and
+streams framed samples to the host PC over USART1 @ 115200 baud.
 
-void SystemClock_Config(void);
-void ADC_Init(void);
-void UART_Init(void);
-void Send_ADC_Value(int16_t value);
+## Sampling pipeline
 
-void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+```
+AD8232 OUT --PA0--> ADC1_IN0
+                    |
+   TIM3 (250 Hz TRGO) triggers conversion
+                    |
+              EOC IRQ -> ring buffer (SPSC, 256 slots)
+                    |
+              main loop packs 16 samples into a framed packet
+                    |
+              USART1 TX (PA9) -> USB-TTL adapter -> PC
+```
 
-    __HAL_RCC_HSE_CONFIG(RCC_HSE_ON);
-    __HAL_RCC_PLL_ENABLE();
+### Packet format (binary, little-endian)
 
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-    HAL_RCC_OscConfig(&RCC_OscInitStruct);
+| Offset | Field  | Type   | Notes                                |
+|--------|--------|--------|--------------------------------------|
+| 0      | sync0  | u8     | 0xAA                                 |
+| 1      | sync1  | u8     | 0x55                                 |
+| 2..3   | seq    | u16 LE | increments per packet                |
+| 4..5   | count  | u16 LE | number of int16 samples (<=16)        |
+| 6..    | data   | i16[]  | `count` little-endian int16 samples  |
+| end-1  | crc8   | u8     | CRC-8 (poly 0x07) over all preceding |
 
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                  RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
-}
+Sample value: `(raw_adc - 2048) * 8`, so the int16 range roughly maps the
+full ADC swing with headroom. On the host, divide by 8 to recover the
+centered 12-bit value.
 
-void ADC_Init(void)
-{
-    __HAL_RCC_ADC1_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
+## Bill of materials (器件清单)
 
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = GPIO_PIN_0;
-    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+| # | Part                       | Spec / value                          | Qty | Notes                                           |
+|---|----------------------------|---------------------------------------|-----|-------------------------------------------------|
+| 1 | Microcontroller            | STM32F103C8T6 (Blue Pill)             | 1   | 72 MHz, 12-bit ADC, USART1                      |
+| 2 | Analog front-end           | AD8232 heart-rate/EEG AFE             | 1   | Single-supply, instrument amp + HP/LP filters    |
+| 3 | EEG electrodes             | Ag/AgCl cup or disposable             | 3   | RA, LA, RL (or 1 signal + 1 ref + 1 driven)     |
+| 4 | Electrode lead wire set    | snap or DIN, shielded                 | 1   | ~1 m, matches electrode connectors              |
+| 5 | Conductive gel             | Ten20 or equivalent                   | 1   | Improve skin contact                            |
+| 6 | USB-TTL serial adapter     | CP2102 / CH340 / FT232                 | 1   | 3.3 V logic, 115200 baud                         |
+| 7 | Power source               | USB 5 V or 3.3 V LDO board             | 1   | STM32 + AD8232 can run from USB                  |
+| 8 | Decoupling caps            | 100 nF + 10 uF                        | 2   | Across AD8232 Vcc/GND                            |
+| 9 | LED (status)               | PC13 onboard LED                      | 1   | Blue Pill already has this                       |
+| 10| Resistor (optional)        | 10 kOhm                               | 1   | MCU BOOT0 pull-down if reusing bare board        |
 
-    hadc1.Instance = ADC1;
-    hadc1.Init.ScanConvMode = DISABLE;
-    hadc1.Init.ContinuousConvMode = ENABLE;
-    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc1.Init.NbrOfConversion = 1;
-    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-    HAL_ADC_Init(&hadc1);
+> AD8232 is biologically safe for learning purposes. It is **not** a medical-
+> grade device. Always power from a floating source (battery or isolated USB)
+> when connecting electrodes to a person.
 
-    ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = ADC_CHANNEL_0;
-    sConfig.Rank = 1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-}
+## Wiring (Blue Pill + AD8232)
 
-void UART_Init(void)
-{
-    __HAL_RCC_USART1_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
+| STM32F103C8T6 | AD8232 / adapter | Function              |
+|---------------|------------------|-----------------------|
+| 3V3           | 3.3V (pin 3)     | AFE supply            |
+| GND           | GND (pin 2)      | Common ground         |
+| PA0 / ADC1_IN0| OUTPUT (pin 1)   | EEG signal            |
+| 5V (USB)      | 3.3V LDO input   | Power chain           |
+| PA9  (USART1_TX)| USB-TTL RXD    | MCU -> PC data        |
+| PA10 (USART1_RX)| USB-TTL TXD    | Optional (no RX use)  |
+| PC13          | onboard LED      | 250 Hz packet blink   |
 
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+AD8232 electrode placement (Einthoven-like, single channel):
+- **RA** - right arm
+- **LA** - left arm (or occipital for visual cortex alpha)
+- **RL** - right leg (driven reference)
 
-    huart1.Instance = USART1;
-    huart1.Init.BaudRate = 115200;
-    huart1.Init.WordLength = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits = UART_STOPBITS_1;
-    huart1.Init.Parity = UART_PARITY_NONE;
-    huart1.Init.Mode = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    HAL_UART_Init(&huart1);
-}
+For better alpha detection, place LA on the occipital region (O1/O2).
 
-void Send_ADC_Value(int16_t value)
-{
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), "%d\r\n", value);
-    HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
-}
+## Build
 
-int main(void)
-{
-    HAL_Init();
-    SystemClock_Config();
-    ADC_Init();
-    UART_Init();
-    HAL_ADC_Start(&hadc1);
+This firmware assumes STM32Cube HAL. Recommended build paths:
 
-    uint32_t last_tick = HAL_GetTick();
+1. **STM32CubeIDE** - create a project for STM32F103C8Tx, enable HSE, set
+   SYSCLK to 72 MHz (HSE 8 MHz x PLL9), add `main.c` from this folder.
+2. **Makefile + arm-none-eabi-gcc** - use the STM32CubeF1 HAL package and
+   include `main.c` as the application source.
 
-    while (1)
-    {
-        if (HAL_GetTick() - last_tick >= 4)
-        {
-            last_tick = HAL_GetTick();
-            HAL_ADC_PollForConversion(&hadc1, 10);
-            uint16_t raw = HAL_ADC_GetValue(&hadc1);
+Required HAL modules:
+- `stm32f1xx_hal_rcc`, `stm32f1xx_hal_gpio`
+- `stm32f1xx_hal_adc` (and `stm32f1xx_hal_adc_ex` for calibration)
+- `stm32f1xx_hal_uart`
+- `stm32f1xx_hal_tim` (and `_ex` for TRGO config)
 
-            int16_t signal = (int16_t)((raw - 2048) * 2);
-            Send_ADC_Value(signal);
-        }
-    }
-}
+### Tweakable constants
+
+| Macro / symbol      | Default | Effect                                |
+|---------------------|---------|---------------------------------------|
+| `TIM3` PSC/ARR      | 7199/39 | 250 Hz sampling (10 kHz / 40)         |
+| `ADC_SAMPLETIME_*`  | 55.5 cy | ~1.5 us acquisition at 36 MHz          |
+| `FRAME_MAX_SAMPLES` | 16      | Samples packed per UART frame         |
+| `ADC_MID`           | 2048    | Mid-scale offset subtracted in IRQ    |
+
+## Notes / safety
+
+- This project is for **learning and demonstration only**. It is not a
+  medical-grade EEG system.
+- Connect electrodes to a human only with a fully floating power source
+  (battery or medically isolated supply). Never use mains-powered
+  equipment without isolation.
+- The 50 Hz notch and 0.5 Hz high-pass filters run on the host side
+  (`software/signal_processor.py`).

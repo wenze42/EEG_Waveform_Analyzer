@@ -1,13 +1,17 @@
-"""
-EEG application entry point.
-Reads serial data, analyzes signal bands, visualizes the waveform, and exports metrics.
+"""EEG application entry point.
+
+Connects to the firmware over serial, drains newly arrived samples on each
+tick, decomposes them into frequency bands, renders a live waveform and
+periodically logs extracted features. Sessions are persisted to HDF5 + CSV
+on exit.
 """
 
-import os
+from __future__ import annotations
+
 import time
 
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -18,18 +22,26 @@ from logger import logger
 from serial_reader import SerialEEGReader
 from signal_processor import SignalProcessor
 
+# Bands shown in the live plot (keep the view compact).
+PLOT_BANDS = ["alpha", "beta", "gamma"]
+
 
 class EEGAnalyzerApp:
     def __init__(self, port=config.SERIAL_PORT, baudrate=config.SERIAL_BAUD):
-        self.serial = SerialEEGReader(port=port, baudrate=baudrate, timeout=config.SERIAL_TIMEOUT)
+        self.serial = SerialEEGReader(port=port, baudrate=baudrate,
+                                      timeout=config.SERIAL_TIMEOUT)
         self.processor = SignalProcessor(fs=config.SAMPLING_RATE)
         self.feature_extractor = FeatureExtractor(fs=config.SAMPLING_RATE)
         self.data_manager = EEGDataManager(data_dir=config.DATA_DIR)
-        self.raw_buffer = []
-        self.band_buffers = {name: [] for name in config.FREQUENCY_BANDS.keys()}
+        self.raw_buffer: list[float] = []
+        self.band_buffers: dict[str, list[float]] = {
+            name: [] for name in config.FREQUENCY_BANDS.keys()
+        }
         self.running = False
+        self._last_metrics_log = 0.0
 
-    def connect(self):
+    # ------------------------------------------------------------------ #
+    def connect(self) -> bool:
         if not self.serial.open():
             return False
         self.running = True
@@ -41,15 +53,18 @@ class EEGAnalyzerApp:
         self.serial.stop_reading()
         self.serial.close()
 
+    # ------------------------------------------------------------------ #
     def update(self):
         if not self.running:
             return
 
-        latest = self.serial.get_latest(n=250)
-        if latest.size == 0:
+        new_samples = self.serial.drain_new_samples()
+        if new_samples.size == 0:
             return
 
-        self.raw_buffer.extend(latest.tolist())
+        # Optionally clean the stream before analysis.
+        cleaned = self.processor.prefilter(new_samples)
+        self.raw_buffer.extend(cleaned.tolist())
         if len(self.raw_buffer) > config.BUFFER_SIZE:
             self.raw_buffer = self.raw_buffer[-config.BUFFER_SIZE:]
 
@@ -57,65 +72,95 @@ class EEGAnalyzerApp:
         if signal.size > 50:
             decomposed = self.processor.decompose_bands(signal)
             for band_name, band_signal in decomposed.items():
-                self.band_buffers[band_name].extend(band_signal.tolist())
-                if len(self.band_buffers[band_name]) > config.BUFFER_SIZE:
-                    self.band_buffers[band_name] = self.band_buffers[band_name][-config.BUFFER_SIZE:]
+                buf = self.band_buffers[band_name]
+                buf.extend(band_signal[-new_samples.size:].tolist())
+                if len(buf) > config.BUFFER_SIZE:
+                    self.band_buffers[band_name] = buf[-config.BUFFER_SIZE:]
 
+    # ------------------------------------------------------------------ #
     def render(self):
-        if not self.running:
+        if not self.running or not self.raw_buffer:
             return
 
         plt.clf()
-        plt.subplot(5, 1, 1)
-        plt.plot(self.raw_buffer[-250:], color='black')
-        plt.title('Raw EEG waveform')
+        plt.subplot(len(PLOT_BANDS) + 1, 1, 1)
+        plt.plot(self.raw_buffer[-250:], color="black")
+        plt.title("Raw EEG waveform")
         plt.grid(True)
 
-        for idx, band_name in enumerate(['alpha', 'beta', 'gamma'], start=2):
+        colors = {"alpha": "tab:blue", "beta": "tab:green", "gamma": "tab:red"}
+        for idx, band_name in enumerate(PLOT_BANDS, start=2):
             data = self.band_buffers.get(band_name, [])
-            plt.subplot(5, 1, idx)
-            plt.plot(data[-250:], color='tab:blue' if band_name == 'alpha' else 'tab:green' if band_name == 'beta' else 'tab:red')
-            plt.title(f'{band_name.upper()} band')
+            plt.subplot(len(PLOT_BANDS) + 1, 1, idx)
+            plt.plot(data[-250:], color=colors.get(band_name, "tab:gray"))
+            low, high = config.FREQUENCY_BANDS[band_name]
+            plt.title(f"{band_name.upper()} band ({low}-{high} Hz)")
             plt.grid(True)
 
         plt.tight_layout()
-        plt.pause(0.05)
+        plt.pause(config.PLOT_REFRESH_S)
 
-    def compute_metrics(self):
+    # ------------------------------------------------------------------ #
+    def compute_metrics(self) -> dict[str, float]:
         signal = np.asarray(self.raw_buffer, dtype=np.float32)
         if signal.size == 0:
             return {}
-
         decomposed = self.processor.decompose_bands(signal)
-        features = self.feature_extractor.extract_all_features(signal, decomposed)
-        return features
+        return self.feature_extractor.extract_all_features(signal, decomposed)
 
-    def save_session(self, filename='latest_session.h5'):
+    def maybe_log_metrics(self):
+        now = time.time()
+        if now - self._last_metrics_log < 2.0:
+            return
+        self._last_metrics_log = now
+        metrics = self.compute_metrics()
+        if metrics:
+            logger.info(
+                "metrics: peak_freq=%.2f engagement=%.3f power_alpha=%.3g "
+                "power_beta=%.3g power_gamma=%.3g",
+                metrics.get("peak_freq", 0.0),
+                metrics.get("engagement_index", 0.0),
+                metrics.get("power_alpha", 0.0),
+                metrics.get("power_beta", 0.0),
+                metrics.get("power_gamma", 0.0),
+            )
+
+    # ------------------------------------------------------------------ #
+    def save_session(self, filename=config.HDF5_FILENAME):
         signal = np.asarray(self.raw_buffer, dtype=np.float32)
-        bands = {band_name: np.asarray(self.band_buffers.get(band_name, []), dtype=np.float32)
-                 for band_name in config.FREQUENCY_BANDS.keys()}
-        payload = {'raw': signal, **bands}
-        return self.data_manager.save_to_hdf5(payload, filename)
+        bands = {
+            name: np.asarray(self.band_buffers.get(name, []), dtype=np.float32)
+            for name in config.FREQUENCY_BANDS.keys()
+        }
+        payload = {"raw": signal, **bands}
+        try:
+            self.data_manager.save_to_hdf5(payload, filename)
+            self.data_manager.export_csv(payload)
+        except Exception as exc:
+            logger.error("Failed to save session: %s", exc)
 
+    # ------------------------------------------------------------------ #
     def run(self):
         if not self.connect():
-            logger.error('Could not connect to serial device. Please check COM port and device status.')
+            logger.error("Could not connect to serial device. "
+                         "Check COM port and device status.")
             return
 
         plt.figure(figsize=config.WINDOW_SIZE)
+        logger.info("EEG acquisition started. Press Ctrl+C to stop.")
         try:
             while True:
                 self.update()
                 self.render()
-                time.sleep(0.05)
+                self.maybe_log_metrics()
+                time.sleep(config.PLOT_REFRESH_S)
         except KeyboardInterrupt:
-            logger.info('User stopped EEG acquisition')
+            logger.info("User stopped EEG acquisition")
         finally:
             self.save_session()
             self.disconnect()
-            plt.close('all')
+            plt.close("all")
 
 
-if __name__ == '__main__':
-    app = EEGAnalyzerApp()
-    app.run()
+if __name__ == "__main__":
+    EEGAnalyzerApp().run()
