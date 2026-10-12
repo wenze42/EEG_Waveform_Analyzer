@@ -9,11 +9,14 @@
  * Packet format (binary, little-endian):
  *   [0xAA][0x55][seq:u16][count:u16][samples:count * i16][crc8:u8]
  *
- * Wiring:
+ * Wiring (Blue Pill ↔ AD8232 Heart Monitor breakout):
  *   PA0  <- AD8232 OUTPUT
  *   PA9  -> USB-TTL RXD  (USART1 TX)
  *   PA10 <- USB-TTL TXD  (USART1 RX, optional)
  *   PC13 -> onboard LED  (status blink)
+ *   3V3  -> AD8232 SDN  (⚠️ 使能脚,低则芯片睡眠无输出!)
+ *   3V3  -> AD8232 3.3v
+ *   GND  -> AD8232 GND
  */
 
 #include "stm32f1xx_hal.h"

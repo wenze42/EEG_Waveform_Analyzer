@@ -51,24 +51,43 @@ centered 12-bit value.
 > grade device. Always power from a floating source (battery or isolated USB)
 > when connecting electrodes to a person.
 
-## Wiring (Blue Pill + AD8232)
+## Wiring (Blue Pill + AD8232 Heart Monitor breakout)
 
-| STM32F103C8T6 | AD8232 / adapter | Function              |
-|---------------|------------------|-----------------------|
-| 3V3           | 3.3V (pin 3)     | AFE supply            |
-| GND           | GND (pin 2)      | Common ground         |
-| PA0 / ADC1_IN0| OUTPUT (pin 1)   | EEG signal            |
-| 5V (USB)      | 3.3V LDO input   | Power chain           |
-| PA9  (USART1_TX)| USB-TTL RXD    | MCU -> PC data        |
-| PA10 (USART1_RX)| USB-TTL TXD    | Optional (no RX use)  |
-| PC13          | onboard LED      | 250 Hz packet blink   |
+> ⚠️ **SDN 必须接 3V3** — AD8232 的 SDN 引脚是使能脚,低电平时芯片睡眠
+> 完全不输出,这是最常见的接错点。板子丝印从上到下依次为:
+> `GND | 3.3v | OUTPUT | LO- | LO+ | SDN`,上方另有 `RL | LA | RA` 电极插口。
 
-AD8232 electrode placement (Einthoven-like, single channel):
-- **RA** - right arm
-- **LA** - left arm (or occipital for visual cortex alpha)
-- **RL** - right leg (driven reference)
+| STM32F103C8T6 | AD8232 breakout | 说明                                |
+|---------------|-----------------|-------------------------------------|
+| 3V3           | **3.3v**        | 模块供电 (板载 LDO 给芯片)          |
+| 3V3           | **SDN**         | 使能脚拉高,否则芯片睡眠无输出       |
+| GND           | **GND**         | 必须共地                            |
+| PA0 / ADC1_IN0| **OUTPUT**      | 唯一采样信号                        |
+| 悬空          | LO- / LO+       | 导联脱落检测,本项目不用             |
+| 5V (USB)      | 3.3V LDO 输入   | 板载 LDO 也可由 5V 供电(可选)       |
+| PA9 (USART1_TX)| USB-TTL RXD    | MCU -> PC 数据                      |
+| PA10 (USART1_RX)| USB-TTL TXD    | 可选(无 RX 用途)                    |
+| PC13          | 板载 LED        | 每帧翻转状态指示                    |
 
-For better alpha detection, place LA on the occipital region (O1/O2).
+AD8232 电极安放 (Einthoven 单通道):
+- **RA** 插口 → 右臂电极
+- **LA** 插口 → 左臂电极 (若检测视觉皮层 α 波,改放枕部 O1/O2)
+- **RL** 插口 → 右腿电极 (驱动参考,抑制共模干扰)
+- 电极先涂导电膏再贴,接触阻抗越低波形越好
+
+### 电阻调参(可选,把心电 AFE 真正变成 EEG AFE)
+
+出厂默认参数是心电拓扑,对 EEG 有两个硬伤。建议第一次先不改电阻跑通链路,
+再按需调整:
+
+| 目标 | 板上位置 | 默认值 | EEG 改值 | 效果 |
+|------|----------|--------|----------|------|
+| **增益 ×100 → ×500** | AD8232 芯片左上侧的 R5、R6 (两颗 10kΩ) | 10 kΩ | **2.2 kΩ** | 放大倍数从 ~100× 提到 ~500×,才够驱动 10–100 μV 的 EEG 信号 |
+| **高通 0.5 Hz → 0.1 Hz** | AD8232 芯片右下侧 R3 旁的 C1 电容 (10 µF) | 10 µF | **47 µF** | 高通截止频率从 ~0.5 Hz 降到 ~0.1 Hz,保留 δ 波 (0.5–4 Hz) 和深睡相关的慢波 |
+| **电源去耦** | 模块 3.3V 和 GND 之间 | 板上已带 100nF+10µF | 板外再并联 **10 µH 磁珠 + 100 nF** | 减少电源线串入的 50/60 Hz 工频干扰 |
+
+> 改电阻/电容需要镊子和焊锡。找不到板上元件时,推荐先用默认值跑起来验证
+> 链路——α 波 (8–12 Hz) 在枕部闭眼时幅值相对最大,不调参也能看到。
 
 ## Build
 
