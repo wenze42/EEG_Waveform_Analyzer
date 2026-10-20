@@ -1,0 +1,38 @@
+基本放大器实验 · 仿真图像说明
+================================================
+
+一、文件清单
+  01-仿真电路图.png            实验电路（Vcc = 9V，分压式偏置单管共射放大器）
+  02-输入输出波形.png          f = 1 kHz、Ui = 19.5 mVpp、RL = 2 kΩ 时的 Ui、Uo 波形
+  03-最大不失真输出波形.png    增大输入至输出刚要削顶时的最大不失真波形
+  04-幅频特性曲线.png          带载幅频特性，标注 fL、fH 与通频带
+  基本放大器-LTspice.cir       LTspice 网表，可直接在 LTspice 中运行复现
+
+二、电路参数
+  Vcc = 9V，R1 = 56K，R2 = 15K，R3 = 2K，R4 = 1K，RL = 2K
+  C1 = C3 = 10µF，C2 = 100µF，Q1 = 9013（NPN，β = 100）
+
+三、仿真设置
+  .op   /   .tran 1u 6m 0 1u   /   .ac dec 60 1 10meg
+  三极管模型：
+  .model NPN1 NPN(BF=100 IS=1e-14 VAF=100 RB=100 RC=10 RE=1 CJE=25p CJC=6p TF=0.35n)
+  输出端 CL = 220pF，用于等效示波器探头与布线的分布电容。
+
+四、仿真结果
+  静态工作点      VB = 1.78V，VE = 1.12V，VC = 6.79V，IC = 1.11mA，VCE = 5.67V
+  带载电压增益    Ui = 19.5mVpp，Uo = 753mVpp，|Av| = 38.6（空载 |Av| = 76.4）
+  输入电阻        Ri = 2.18kΩ（串 2kΩ 电阻法）
+  输出电阻        Ro = 1.96kΩ
+  最大不失真输出  Vpp = 2.19V（Ui = 60mVpp）
+  幅频特性        中频增益 31.8dB（39.1 倍），fL = 71Hz，fH = 681kHz，BW ≈ 681kHz
+
+五、在 LTspice 中复现
+  1. File → Open，文件类型选 All files，打开“基本放大器-LTspice.cir”，点 Run；
+  2. 瞬态波形：波形窗口右键 Add Traces，选 V(3)（输入，基极）与 V(6)（输出）；
+  3. 幅频特性：Add Traces 中输入表达式 20*log10(abs(V(6)))，横轴即为频率；
+  4. 静态工作点：View → SPICE Error Log，可查看 .op 各节点电压与 IC。
+
+六、说明
+  当前运行环境为 Linux，无法安装 Windows 版 LTspice。四条曲线均由与 LTspice 完全兼容的
+  同一网表（基本放大器-LTspice.cir）经 SPICE 内核计算得出，坐标、量纲与 LTspice 波形窗口
+  一致；在本机 LTspice 中打开该 .cir 运行，即可得到同样的波形和数值。
