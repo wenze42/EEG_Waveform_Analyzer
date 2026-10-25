@@ -18,6 +18,7 @@ CL 6 0 220p
 .op
 .tran 1u 6m 0 1u
 .ac dec 60 1 10meg
+.save V(3) V(6)
 .meas tran Ui_pp PP V(3) FROM=4m TO=6m
 .meas tran Uo_pp PP V(6) FROM=4m TO=6m
 .end

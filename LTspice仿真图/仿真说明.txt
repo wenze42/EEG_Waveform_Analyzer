@@ -13,7 +13,7 @@
   C1 = C3 = 10µF，C2 = 100µF，Q1 = 9013（NPN，β = 100）
 
 三、仿真设置
-  .op   /   .tran 1u 6m 0 1u   /   .ac dec 60 1 10meg
+  .op   /   .tran 1u 6m 0 1u   /   .ac dec 60 1 10meg   /   .save V(3) V(6)
   三极管模型：
   .model NPN1 NPN(BF=100 IS=1e-14 VAF=100 RB=100 RC=10 RE=1 CJE=25p CJC=6p TF=0.35n)
   输出端 CL = 220pF，用于等效示波器探头与布线的分布电容。
