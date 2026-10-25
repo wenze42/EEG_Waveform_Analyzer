@@ -21,10 +21,10 @@
 四、仿真结果
   静态工作点      VB = 1.78V，VE = 1.12V，VC = 6.79V，IC = 1.11mA，VCE = 5.67V
   带载电压增益    Ui = 19.5mVpp，Uo = 753mVpp，|Av| = 38.6（空载 |Av| = 76.4）
-  输入电阻        Ri = 2.18kΩ（串 2kΩ 电阻法）
-  输出电阻        Ro = 1.96kΩ
+  输入电阻        Ri = 2.40kΩ（串 2kΩ 电阻法，Rs 上压降约 45%）
+  输出电阻        Ro = 1.96kΩ（空载 1.49Vpp / 带载 0.75Vpp）
   最大不失真输出  Vpp = 2.19V（Ui = 60mVpp）
-  幅频特性        中频增益 31.8dB（39.1 倍），fL = 71Hz，fH = 681kHz，BW ≈ 681kHz
+  幅频特性        中频增益 31.8dB（39.1 倍），fL = 71Hz，fH = 683kHz，BW ≈ 683kHz
 
 五、在 LTspice 中复现
   1. File → Open，文件类型选 All files，打开“基本放大器-LTspice.cir”，点 Run；
