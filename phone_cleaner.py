@@ -4,19 +4,23 @@
 手机文件夹清理与分类工具（Windows / macOS 通用，只用 Python 标准库）
 
 用途：
-  1. 扫描一份手机文件夹副本，按中文分类输出报告；
-  2. 可选把文件按分类复制（或移动）到「整理结果」目录；
-  3. 可选把无用文件移到「待删除」目录，由你自己确认后再清空。
+  1. 通过 adb 直接从手机导出文件（推荐，比 Windows 的 MTP 稳定）；
+  2. 扫描一份已导出的副本，按中文分类输出报告；
+  3. 可选把文件按分类复制（或移动）到「整理结果」目录；
+  4. 可选把无用文件移到「待删除」目录，由你自己确认后再清空。
 
-注意：脚本只操作你电脑上的副本，不会直接动手机。
-      手机通过 MTP 连接时没有真实盘符，请先把内部存储里要处理的文件夹
-      复制到电脑硬盘（例如 D:\\phone），再用 --src 指向它。
+两种用法：
+  A. 手机开启「USB 调试」并连上电脑，让脚本直接读手机（不用手动复制）：
+       python phone_cleaner.py --adb
+  B. 手机文件夹已经在电脑硬盘上（例如 D:\\phone），直接扫描：
+       python phone_cleaner.py --src "D:\\phone"
 
 常用命令：
-  python phone_cleaner.py --src "D:\\phone"                       # 只扫描，出报告
-  python phone_cleaner.py --src "D:\\phone" --apply               # 扫描 + 复制归档
+  python phone_cleaner.py --adb                                   # 导出手机常用目录并扫描
+  python phone_cleaner.py --adb --adb目录 "DCIM,Download"         # 只导出指定目录
+  python phone_cleaner.py --adb --apply --skip-junk               # 导出 + 按分类归档
+  python phone_cleaner.py --src "手机导出" --delete --yes          # 清理无用文件到「待删除」
   python phone_cleaner.py --src "D:\\phone" --apply --move        # 扫描 + 移动归档
-  python phone_cleaner.py --src "D:\\phone" --delete --yes        # 把无用文件移到「待删除」
 """
 
 import argparse
@@ -24,6 +28,7 @@ import csv
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -440,17 +445,141 @@ def 写日志(日志, 报告目录):
     return path
 
 
+# ---------------------------------------------------------------- adb 导出
+
+# 手机内部存储里默认要导出的目录（存在哪个就导哪个）
+默认导出目录 = [
+    "DCIM", "Pictures", "Download", "Documents", "Movies", "Music",
+    "Recordings", "录音", "Ringtones", "tencent",
+]
+
+adb_安装提示 = """
+[错误] 没有找到 adb 命令。
+
+adb 是 Android 官方调试工具，比 Windows 自带的 MTP 传输稳定得多。
+安装方法（Windows）：
+  1. 下载 platform-tools：
+     https://dl.google.com/android/repository/platform-tools-latest-windows.zip
+  2. 解压到任意目录，例如 D:\\platform-tools
+  3. 把这行加到系统环境变量 Path，或直接在本脚本同目录下放一个 platform-tools 文件夹
+  4. 重新打开 PowerShell，运行 adb version 确认可用
+
+手机端设置（vivo X200S）：
+  1. 设置 → 更多设置 → 关于手机 → 连续点「软件版本号」7 次，开启开发者选项
+  2. 设置 → 更多设置 → 开发者选项 → 打开「USB 调试」
+  3. 数据线连电脑，手机弹窗选「允许 USB 调试」（可勾选「一律允许」）
+  4. 手机下拉通知栏，把 USB 用途切换为「传输文件」
+"""
+
+
+def 找adb():
+    """优先用 PATH 里的 adb，其次用脚本同目录下 platform-tools 里的。"""
+    for name in ("adb", "adb.exe"):
+        p = shutil.which(name)
+        if p:
+            return p
+    这里 = os.path.dirname(os.path.abspath(__file__))
+    for cand in (
+        os.path.join(这里, "platform-tools", "adb.exe"),
+        os.path.join(这里, "platform-tools", "adb"),
+        os.path.join(这里, "adb.exe"),
+        os.path.join(这里, "adb"),
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def adb运行(adb, 参数):
+    try:
+        return subprocess.run(
+            [adb] + 参数, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except OSError as e:
+        print(f"[错误] 运行 adb 失败：{e}")
+        return None
+
+
+def 获取设备(adb):
+    adb运行(adb, ["start-server"])
+    r = adb运行(adb, ["devices"])
+    if not r:
+        return None
+    行 = [x.split() for x in r.stdout.splitlines()[1:] if x.strip()]
+    ready = [x for x in 行 if len(x) >= 2 and x[1] == "device"]
+    if ready:
+        return ready[0][0]
+    状态 = {x[1] for x in 行 if len(x) >= 2}
+    if "unauthorized" in 状态:
+        print("[错误] 手机还没授权调试。请在手机屏幕上点「允许 USB 调试」，然后重试。")
+    elif "offline" in 状态:
+        print("[错误] 设备处于 offline 状态。请拔插数据线，或运行 adb kill-server 后重试。")
+    else:
+        print("[错误] 没有检测到已连接的设备。请检查：")
+        print("  · 数据线是否支持传输（不是只能充电的线）")
+        print("  · USB 用途是否选为「传输文件」")
+        print("  · 开发者选项里的「USB 调试」是否已打开")
+    return None
+
+
+def 手机有该目录(adb, serial, 路径):
+    r = adb运行(adb, ["-s", serial, "shell", "ls", "-d", 路径])
+    return bool(r) and r.returncode == 0 and "No such file" not in (r.stdout + r.stderr)
+
+
+def 从手机导出(导出目录, 目录参数=""):
+    adb = 找adb()
+    if not adb:
+        print(adb_安装提示)
+        return False
+
+    serial = 获取设备(adb)
+    if not serial:
+        return False
+
+    要导出 = [x.strip().strip("/") for x in 目录参数.split(",") if x.strip()] if 目录参数 else 默认导出目录
+
+    print(f"已连接设备：{serial}")
+    print(f"导出到：{os.path.abspath(导出目录)}\n")
+
+    成功数 = 0
+    失败 = []
+    for 名 in 要导出:
+        远端 = f"/sdcard/{名}"
+        if not 手机有该目录(adb, serial, 远端):
+            print(f"[跳过] 手机里没有 {名}")
+            continue
+        本地 = os.path.join(导出目录, 名)
+        print(f"[导出] {远端} → {本地}")
+        r = subprocess.run([adb, "-s", serial, "pull", 远端, 本地])
+        if r.returncode == 0:
+            成功数 += 1
+        else:
+            失败.append(名)
+            print(f"[失败] {名} 导出中断。可重新运行脚本继续，已导出的文件会被覆盖但不会丢失")
+
+    print()
+    if 成功数 == 0:
+        print("[错误] 一个目录都没导出成功。可先用 --adb目录 \"DCIM\" 测试单个目录。")
+        return False
+    if 失败:
+        print(f"[提示] 有 {len(失败)} 个目录导出失败：{', '.join(失败)}")
+    print(f"共导出 {成功数} 个目录。")
+    return True
+
+
 # ---------------------------------------------------------------- 入口
 
 def main():
     for s in (sys.stdout, sys.stderr):
         try:
-            s.reconfigure(encoding="utf-8", errors="replace")
+            s.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
         except Exception:
             pass
 
     p = argparse.ArgumentParser(description="手机文件夹清理与分类工具")
-    p.add_argument("--src", required=True, help="手机文件夹副本的路径，例如 D:\\phone")
+    p.add_argument("--src", help="已导出到电脑的手机文件夹路径，例如 D:\\phone（配合 --adb 时可省略）")
     p.add_argument("--out", default="整理结果", help="整理后文件的输出目录（默认：整理结果）")
     p.add_argument("--报告目录", "--report", dest="报告目录", default="清理报告", help="报告输出目录")
     p.add_argument("--apply", action="store_true", help="执行复制（不改动源文件）")
@@ -459,13 +588,27 @@ def main():
     p.add_argument("--yes", action="store_true", help="配合 --delete 使用，表示已确认")
     p.add_argument("--include-apk", action="store_true", help="把安装包也列为可删候选")
     p.add_argument("--skip-junk", action="store_true", help="归档时跳过可删候选和多余的重复文件")
+    p.add_argument("--adb", action="store_true", help="用 adb 直接从手机导出文件（需开启 USB 调试）")
+    p.add_argument("--adb目录", default="", help="要导出的手机目录，逗号分隔，如 DCIM,Download")
+    p.add_argument("--导出目录", default="手机导出", help="adb 导出到本地的目录（默认：手机导出）")
     args = p.parse_args()
+
+    if args.adb:
+        if not 从手机导出(args.导出目录, args.adb目录):
+            sys.exit(1)
+        args.src = args.导出目录
+
+    if not args.src:
+        print("[错误] 请用 --adb 直接读手机，或者用 --src 指定已导出的目录。")
+        print("例如：python phone_cleaner.py --adb")
+        print("      python phone_cleaner.py --src \"D:\\phone\"")
+        sys.exit(1)
 
     src = os.path.abspath(os.path.expanduser(args.src))
     if not os.path.isdir(src):
         print(f"[错误] 找不到目录：{src}")
-        print("提示：MTP 连接的手机没有盘符，请先把内部存储里要处理的文件夹复制到电脑硬盘，")
-        print("      例如复制到 D:\\phone，再用 --src \"D:\\phone\" 运行。")
+        print("提示：如果是手动复制的手机文件，请确认路径正确；")
+        print("      或者用 --adb 让脚本直接从手机导出。")
         sys.exit(1)
     if os.path.abspath(args.out) == src:
         print("[错误] 输出目录不能和源目录相同。")
