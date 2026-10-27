@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 
@@ -528,6 +529,36 @@ def 手机有该目录(adb, serial, 路径):
     return bool(r) and r.returncode == 0 and "No such file" not in (r.stdout + r.stderr)
 
 
+def 拉取目录(adb, serial, 远端, 本地, 导出目录):
+    """导出单个目录。中文路径失败时，改用英文临时目录再搬进来。"""
+    os.makedirs(os.path.dirname(本地), exist_ok=True)
+    r = subprocess.run([adb, "-s", serial, "pull", 远端, 本地])
+    if r.returncode == 0:
+        return True
+
+    print("  [重试] 改用英文临时目录传输，避免 adb 处理中文路径出错……")
+    临时 = tempfile.mkdtemp(prefix="adb_pull_")
+    r = subprocess.run([adb, "-s", serial, "pull", 远端, 临时])
+    if r.returncode != 0:
+        shutil.rmtree(临时, ignore_errors=True)
+        return False
+
+    内层 = os.path.join(临时, os.path.basename(远端))
+    try:
+        if os.path.isdir(内层):
+            shutil.move(内层, 本地)
+        else:
+            os.makedirs(本地, exist_ok=True)
+            for 项 in os.listdir(临时):
+                shutil.move(os.path.join(临时, 项), os.path.join(本地, 项))
+    except (OSError, shutil.Error) as e:
+        print(f"  [错误] 搬运文件失败：{e}")
+        return False
+    finally:
+        shutil.rmtree(临时, ignore_errors=True)
+    return True
+
+
 def 从手机导出(导出目录, 目录参数=""):
     adb = 找adb()
     if not adb:
@@ -539,6 +570,8 @@ def 从手机导出(导出目录, 目录参数=""):
         return False
 
     要导出 = [x.strip().strip("/") for x in 目录参数.split(",") if x.strip()] if 目录参数 else 默认导出目录
+
+    os.makedirs(导出目录, exist_ok=True)
 
     print(f"已连接设备：{serial}")
     print(f"导出到：{os.path.abspath(导出目录)}\n")
@@ -552,8 +585,7 @@ def 从手机导出(导出目录, 目录参数=""):
             continue
         本地 = os.path.join(导出目录, 名)
         print(f"[导出] {远端} → {本地}")
-        r = subprocess.run([adb, "-s", serial, "pull", 远端, 本地])
-        if r.returncode == 0:
+        if 拉取目录(adb, serial, 远端, 本地, 导出目录):
             成功数 += 1
         else:
             失败.append(名)
