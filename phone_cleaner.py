@@ -19,6 +19,7 @@
   python phone_cleaner.py --adb                                   # 导出手机常用目录并扫描
   python phone_cleaner.py --adb --adb目录 "DCIM,Download"         # 只导出指定目录
   python phone_cleaner.py --adb --apply --skip-junk               # 导出 + 按分类归档
+  python phone_cleaner.py --src "手机导出" --手机清理              # 按扫描结果在手机上删无用文件
   python phone_cleaner.py --src "手机导出" --delete --yes          # 清理无用文件到「待删除」
   python phone_cleaner.py --src "D:\\phone" --apply --move        # 扫描 + 移动归档
 """
@@ -71,11 +72,15 @@ SYSTEM_ROOT_DIRS = {
 # 缓存/临时/缩略图目录：里面的文件列为可删候选（不会自动删）
 JUNK_DIR_NAMES = {
     "cache", "cache2", ".cache", "temp", "tmp", ".tmp",
-    ".thumbnails", "thumbnails", "log", "logs", "crash", "crashlog",
+    ".thumbnails", "thumbnails", ".thumb", ".tmfs", ".thumbcache",
+    "log", "logs", "crash", "crashlog",
 }
 
 # 可删候选的后缀（系统产生的临时/日志/备份文件）
 JUNK_EXTS = {".log", ".tmp", ".temp", ".bak", ".dmp", ".crdownload", ".part"}
+
+# 这些是系统用来屏蔽相册扫描的标记文件，不能当垃圾删
+KEEP_META = {".nomedia", ".database_uuid"}
 
 OTHER_CATS = {"01_照片", "02_视频"}  # 这两类按年份分子目录
 
@@ -205,12 +210,20 @@ def 扫描(src, include_apk=False):
 
     # 可删候选
     for f in res.files:
-        if 任何(f["目录部分"], JUNK_DIR_NAMES):
+        if f["文件名"].lower() in KEEP_META:
+            continue
+        if f["文件名"].startswith("dumpDebug_") and f["后缀"] == ".txt":
+            原因 = "vivo 相机调试转储"
+        elif 任何(f["目录部分"], JUNK_DIR_NAMES):
             原因 = "缓存/临时/缩略图目录"
-        elif f["大小"] == 0:
-            原因 = "空文件（0 字节）"
+        elif "documents" in f["目录部分"] and "ringtone" in f["目录部分"] and "gamefree" in f["目录部分"]:
+            原因 = "游戏铃声配置残渣"
         elif f["后缀"] in JUNK_EXTS:
             原因 = "临时文件/日志/备份"
+        elif f["后缀"] == ".cuid" or f["文件名"].startswith(".thumbcache"):
+            原因 = "系统残留标记"
+        elif f["大小"] == 0:
+            原因 = "空文件（0 字节）"
         elif f["后缀"] in {".apk", ".apks", ".xapk", ".apkm"} and include_apk:
             原因 = "已安装的安装包（按需清理）"
         else:
@@ -601,6 +614,61 @@ def 从手机导出(导出目录, 目录参数=""):
     return True
 
 
+def 清理手机(res, src):
+    """把扫描出的无用文件和空文件夹，直接在手机上删掉。需要二次确认。"""
+    adb = 找adb()
+    if not adb:
+        print(adb_安装提示)
+        return False
+    serial = 获取设备(adb)
+    if not serial:
+        return False
+
+    文件项 = [(x["相对路径"], x["大小"], x["原因"]) for x in res.junk]
+    文件夹项 = sorted((os.path.relpath(d, src) for d in res.empty_dirs), key=lambda x: x.count(os.sep), reverse=True)
+    总大小 = sum(x[1] for x in 文件项)
+
+    print(f"\n===== 准备清理手机 =====")
+    print(f"文件：{len(文件项)} 个，约 {人类可读(总大小)}")
+    for p, s, r in 文件项[:30]:
+        print(f"  - {p}    （{r}，{人类可读(s)}）")
+    if len(文件项) > 30:
+        print(f"  …… 另有 {len(文件项) - 30} 个文件")
+    print(f"空文件夹：{len(文件夹项)} 个")
+    for p in 文件夹项[:10]:
+        print(f"  - {p}")
+    if len(文件夹项) > 10:
+        print(f"  …… 另有 {len(文件夹项) - 10} 个")
+    print("\n只删除上面列出的项目；照片、视频、文档、聊天文件一律不动。")
+    print("空文件夹用 rmdir 删除，里面如果还有文件会失败，不会被连带删除。")
+
+    try:
+        确认 = input("\n确认在手机上执行删除？输入「确认删除」才会执行：").strip()
+    except EOFError:
+        确认 = ""
+    if 确认 != "确认删除":
+        print("已取消，手机没有任何改动。")
+        return False
+
+    失败 = []
+    for p, s, r in 文件项:
+        远端 = "/sdcard/" + p.replace("\\", "/")
+        r_ = adb运行(adb, ["-s", serial, "shell", f'rm -f -- "{远端}"'])
+        if not r_ or r_.returncode != 0:
+            失败.append((p, (r_.stderr if r_ else "").strip()))
+
+    for p in 文件夹项:
+        远端 = "/sdcard/" + p.replace("\\", "/")
+        adb运行(adb, ["-s", serial, "shell", f'rmdir -- "{远端}"'])
+
+    print(f"\n清理完成：成功 {len(文件项) - len(失败)} 项，失败 {len(失败)} 项，释放约 {人类可读(总大小)}")
+    for p, e in 失败[:10]:
+        print(f"  [失败] {p} {e}")
+    if 失败:
+        print("\n失败通常是文件正被应用占用，重启手机或关闭相机后再试。")
+    return True
+
+
 # ---------------------------------------------------------------- 入口
 
 def 交互菜单():
@@ -612,6 +680,7 @@ def 交互菜单():
     print("  2. 导出、扫描并按分类归档（原手机不动）")
     print("  3. 导出、归档，并清理无用文件（进「待删除」）")
     print("  4. 不连手机，扫描已有的「手机导出」目录")
+    print("  5. 按扫描结果，清理手机上的无用文件（需二次确认）")
     print("  0. 退出")
     print("=" * 48)
     try:
@@ -622,7 +691,7 @@ def 交互菜单():
         选择 = "1"
     if 选择 in ("0", "q", "Q", "退出"):
         return "0"
-    if 选择 not in ("1", "2", "3", "4"):
+    if 选择 not in ("1", "2", "3", "4", "5"):
         print(f"没有「{选择}」这个选项，按 1 处理。")
         return "1"
     return 选择
@@ -648,6 +717,7 @@ def main():
     p.add_argument("--adb", action="store_true", help="用 adb 直接从手机导出文件（需开启 USB 调试）")
     p.add_argument("--adb目录", default="", help="要导出的手机目录，逗号分隔，如 DCIM,Download")
     p.add_argument("--导出目录", default="手机导出", help="adb 导出到本地的目录（默认：手机导出）")
+    p.add_argument("--手机清理", action="store_true", help="在手机上直接删除扫描出的无用文件和空文件夹（需再次输入确认）")
     args = p.parse_args()
 
     # 双击 .bat 启动、没有任何参数时，进入中文菜单
@@ -673,6 +743,9 @@ def main():
                 args.delete = False
         elif 选择 == "4":
             args.src = "手机导出"
+        elif 选择 == "5":
+            args.src = "手机导出"
+            args.手机清理 = True
         else:
             args.adb = True
 
@@ -748,9 +821,12 @@ def main():
             成功 = sum(1 for x in 日志 if x[4] == "成功")
             print(f"已处理 {成功} 项，可在「{args.报告目录}\\待删除」中复核后手工清空。")
 
+    if args.手机清理:
+        清理手机(res, src)
+
     if 日志:
         print(f"操作日志：{写日志(日志, args.报告目录)}")
-    else:
+    elif not args.手机清理:
         print("\n本次仅扫描，没有改动任何文件。加 --apply 可复制归档，加 --delete --yes 可清理无用文件。")
 
 
