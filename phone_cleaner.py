@@ -571,6 +571,31 @@ def 从手机导出(导出目录, 目录参数=""):
 
 # ---------------------------------------------------------------- 入口
 
+def 交互菜单():
+    print()
+    print("=" * 48)
+    print("          手机文件夹整理工具")
+    print("=" * 48)
+    print("  1. 导出并扫描（不改任何文件，建议先做）")
+    print("  2. 导出、扫描并按分类归档（原手机不动）")
+    print("  3. 导出、归档，并清理无用文件（进「待删除」）")
+    print("  4. 不连手机，扫描已有的「手机导出」目录")
+    print("  0. 退出")
+    print("=" * 48)
+    try:
+        选择 = input("请输入序号后回车（直接回车 = 1）：").strip()
+    except EOFError:
+        选择 = ""
+    if not 选择:
+        选择 = "1"
+    if 选择 in ("0", "q", "Q", "退出"):
+        return "0"
+    if 选择 not in ("1", "2", "3", "4"):
+        print(f"没有「{选择}」这个选项，按 1 处理。")
+        return "1"
+    return 选择
+
+
 def main():
     for s in (sys.stdout, sys.stderr):
         try:
@@ -592,6 +617,32 @@ def main():
     p.add_argument("--adb目录", default="", help="要导出的手机目录，逗号分隔，如 DCIM,Download")
     p.add_argument("--导出目录", default="手机导出", help="adb 导出到本地的目录（默认：手机导出）")
     args = p.parse_args()
+
+    # 双击 .bat 启动、没有任何参数时，进入中文菜单
+    if not args.src and not args.adb and not (args.apply or args.delete or args.move):
+        选择 = 交互菜单()
+        if 选择 == "0":
+            print("已退出，没有改动任何文件。")
+            return
+        if 选择 == "2":
+            args.adb = True
+            args.apply = True
+            args.skip_junk = True
+        elif 选择 == "3":
+            args.adb = True
+            args.apply = True
+            args.skip_junk = True
+            args.delete = True
+            args.include_apk = True
+            确认 = input("\n清理会把无用文件移到「清理报告\\待删除」，原手机不动。确认继续？(y/N)：").strip().lower()
+            args.yes = 确认 in ("y", "yes", "是")
+            if not args.yes:
+                print("已取消清理，只做导出和归档。")
+                args.delete = False
+        elif 选择 == "4":
+            args.src = "手机导出"
+        else:
+            args.adb = True
 
     if args.adb:
         if not 从手机导出(args.导出目录, args.adb目录):
