@@ -1,5 +1,55 @@
 # AGENTS.md
 
+> 核心理念：**AI 说过了不算，证据过了才算。** 把工程纪律从人的脑子搬进 AI 上下文。
+> 方法论详解见 `docs/METHODOLOGY.md`。
+
+## 项目四件套（仓库内的长期资产）
+
+| 文件 | 作用 |
+|------|------|
+| `CONTEXT.md` | 产品语境 + "避免"表，专治对齐错位 |
+| `GLOSSARY.md` | 人机共用词汇表，同一个词同一含义 |
+| `AGENTS.md` + `docs/adr/` | 常驻规则 + 历史决策（ADR） |
+| `.agents/skills/` | 38 个 Pocock skill + 2 个项目自定义 skill |
+
+**插头与插座原则**：AI agent（插头）随时可换，协作纪律（插座）跟仓库走。
+
+## 开发门禁（硬门槛）
+
+> 详细流程见 `.agents/skills/dev-gating/SKILL.md` 和 `docs/METHODOLOGY.md`。
+
+### 代码前门（写代码之前必须完成）
+
+1. 确认一个主要 Issue + 一个 Spec；
+2. 建立验收矩阵：每个 User Story、失败场景、权限边界、恢复路径至少一行；
+3. 写清楚范围内/范围外、依赖、领域不变量；
+4. **共识确认之前，拒绝动手写码**（调用 `grilling` 协议）。
+
+### 验收门（PR 转 Ready 之前必须满足）
+
+- [ ] 验收矩阵**每一行**都有**当前 head**的可复核证据；
+- [ ] 定向测试、构建、lint、集成测试的命令和结果已记录；
+- [ ] PR body 的 SHA、CI 链接、结论指向当前 head；
+- [ ] 必需项无 `TODO`、`NOT RUN`、`BLOCKED` 状态；
+- [ ] **绿色通用 CI 不能替代 Spec 证据**；
+- [ ] Agent 不应把常规测试、日志整理、报告编写或本地依赖准备交给用户。
+
+### 合并条件
+
+- PR 非 Draft；
+- 评审 **Blocker** 已全部修复；
+- 当前 head 的必需 CI 全部通过；
+- 最终审查人（人类）明确通过。
+
+## 人机分工（不可外包 vs 可规模化）
+
+| 维度 | 人（判断 · 不可外包） | AI（执行 · 可规模化） |
+|------|----------------------|----------------------|
+| 需求 | 定义 + 确认 | 提问 + 澄清 |
+| 规范 | 写 CONTEXT / GLOSSARY / ADR | 遵守 + 提示冲突 |
+| 代码 | 审证据、做决策 | 生成、重构、修 bug |
+| 验收 | 定矩阵、判 PASS/FAIL | 跑验证、补证据 |
+
 ## Agent skills
 
 ### Issue tracker
@@ -99,6 +149,13 @@ Each entry lists the trigger phrases, the skill name, and a one-line description
 | 写文章、塑形（素材够了开始写） | `writing-shape` | 一段一段塑造成文章 |
 | 拷问工作流 spec | `loop-me` | grill-me 的工作流版本 |
 
+#### 项目自定义 Skills（基于 LingDoc 实战）
+
+| When user says… | Skill | Description |
+|-----------------|-------|-------------|
+| 开发门禁、验收矩阵、证据、PR Draft/Ready | `dev-gating` | 两道门：代码前门（锁定范围 + 矩阵）和验收门（Agent 闭环证据）。AI 说过了不算，证据过了才算 |
+| 健康度评分、结构债务、重构方向 | `health-scoring` | H_L（内部健康度）+ F_R（外部契合度），六维诊断，按复杂性降低收益排序重构 |
+
 #### Specialized
 
 | When user says… | Skill | Description |
@@ -120,3 +177,7 @@ Each entry lists the trigger phrases, the skill name, and a one-line description
 npx skills@latest add mattpocock/skills --all
 npx skills@latest update
 ```
+
+### 自定义 Skill 同步
+
+本仓库的 2 个自定义 skill（dev-gating、health-scoring）在 `.agents/skills/` 下，通过 `npx skills@latest sync` 或手动复制同步到其他 AI agent 的 skills 目录。
